@@ -10,15 +10,18 @@ from utils import getenv, set_env_variables
 import json, time
 
 import litellm
-from litellm import BudgetManager
+from litellm import BudgetManager, Cache
+from litellm.caching import Cache
 litellm.max_budget = 1000 
 
-budget_manager = BudgetManager(project_name=os.getenv("PROJECT_NAME"), client_type="hosted")
+# Use local budget manager instead of hosted
+budget_manager = BudgetManager(project_name="litellm-proxy", client_type="local")
 
-from fastapi import FastAPI, Request, status, HTTPException, Depends
+from fastapi import FastAPI, Request, status, HTTPException, Depends, Body
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 app = FastAPI()
 
 app.add_middleware(
@@ -29,6 +32,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 master_key = os.getenv("LITELLM_PROXY_MASTER_KEY", "sk-litellm-master-key")
+
+# Initialize Redis cache if Redis is available
+user_api_key_cache = None
+redis_host = os.getenv("REDISHOST")
+redis_port = os.getenv("REDISPORT")
+redis_password = os.getenv("REDISPASSWORD")
+
+if redis_host and redis_port:
+    try:
+        user_api_key_cache = Cache(
+            type="redis",
+            host=redis_host,
+            port=redis_port,
+            password=redis_password if redis_password else None,
+            namespace="litellm:user_api_keys:"
+        )
+        print("Redis cache for user API keys initialized successfully")
+    except Exception as e:
+        print(f"Failed to initialize Redis cache: {str(e)}")
+
+# Load user API keys from budget manager
 user_api_keys = set(budget_manager.get_users())
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -37,12 +61,29 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 def user_api_key_auth(api_key: str = Depends(oauth2_scheme)):
     if api_key == master_key:
         return
-    if api_key not in user_api_keys:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "invalid user key"},
-            # TODO: this will be {'detail': {'error': 'something'}}
-        )
+    
+    # Check in-memory cache first
+    if api_key in user_api_keys:
+        return
+    
+    # If Redis cache is available, check there too
+    if user_api_key_cache:
+        try:
+            # Try to get the user from Redis cache
+            cached_user = user_api_key_cache.get_cache(key=f"user:{api_key}")
+            if cached_user:
+                # Add to in-memory cache for faster future lookups
+                user_api_keys.add(api_key)
+                return
+        except Exception as e:
+            print(f"Error checking Redis cache: {str(e)}")
+    
+    # If we get here, the key is not valid
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"error": "invalid user key"},
+        # TODO: this will be {'detail': {'error': 'something'}}
+    )
 
 
 def key_auth(api_key: str = Depends(oauth2_scheme)):
@@ -118,6 +159,56 @@ async def report_current(request: Request):
     return budget_manager.get_model_cost(key)
 
 
+class UserUpdateWithIdRequest(BaseModel):
+    user_id: str
+    total_budget: float = None
+    duration: str = None
+    metadata: dict = None
+
+@app.post("/user/update", dependencies=[Depends(key_auth)])
+async def update_user(user_data: UserUpdateWithIdRequest):
+    try:
+        user_id = user_data.user_id
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "user_id is required"}
+            )
+        
+        # Update user in budget manager
+        update_data = {}
+        if user_data.total_budget is not None:
+            update_data["total_budget"] = user_data.total_budget
+        if user_data.duration is not None:
+            update_data["duration"] = user_data.duration
+        if user_data.metadata is not None:
+            update_data["metadata"] = user_data.metadata
+            
+        # Update user in budget manager
+        budget_manager.update_budget(user=user_id, **update_data)
+        
+        # Update user in Redis cache if available
+        if user_api_key_cache:
+            try:
+                # Get current user data
+                user_data = budget_manager.get_budget(user=user_id)
+                # Update in Redis cache
+                user_api_key_cache.add_cache(
+                    result=user_data,
+                    key=f"user:{user_id}"
+                )
+                print(f"Updated user {user_id} in Redis cache")
+            except Exception as e:
+                print(f"Error updating Redis cache: {str(e)}")
+        
+        return {"status": "success", "user_id": user_id, "updated": update_data}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": str(e)}
+        )
+
 @app.post("/key/new", dependencies=[Depends(key_auth)])
 async def generate_key(request: Request):
     try:
@@ -135,6 +226,18 @@ async def generate_key(request: Request):
             total_budget=total_budget, user=api_key, duration="monthly"
         )
         user_api_keys.add(api_key)
+        
+        # Add to Redis cache if available
+        if user_api_key_cache:
+            try:
+                user_data = budget_manager.get_budget(user=api_key)
+                user_api_key_cache.add_cache(
+                    result=user_data,
+                    key=f"user:{api_key}"
+                )
+                print(f"Added new user {api_key} to Redis cache")
+            except Exception as e:
+                print(f"Error adding to Redis cache: {str(e)}")
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
