@@ -14,8 +14,7 @@ from litellm import BudgetManager, Cache
 from litellm.caching import Cache
 litellm.max_budget = 1000 
 
-# Use local budget manager instead of hosted
-budget_manager = BudgetManager(project_name="litellm-proxy", client_type="local")
+budget_manager = BudgetManager(project_name="litellm-proxy", client_type="hosted")
 
 from fastapi import FastAPI, Request, status, HTTPException, Depends, Body
 from fastapi.responses import StreamingResponse
