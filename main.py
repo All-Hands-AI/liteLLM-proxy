@@ -10,12 +10,11 @@ from utils import getenv, set_env_variables
 import json, time
 
 import litellm
-from litellm import BudgetManager, Cache
+from litellm import BudgetManager
 from litellm.caching import Cache
 litellm.max_budget = 1000 
 
-# Use local budget manager instead of hosted
-budget_manager = BudgetManager(project_name="litellm-proxy", client_type="local")
+budget_manager = BudgetManager(project_name=os.getenv("PROJECT_NAME"), client_type="hosted")
 
 from fastapi import FastAPI, Request, status, HTTPException, Depends, Body
 from fastapi.responses import StreamingResponse
